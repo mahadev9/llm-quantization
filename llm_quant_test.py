@@ -3,8 +3,9 @@ import time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# MODEL_DIR = "Qwen3.5-0.8B-NVFP4"
-MODEL_DIR = "Qwen3.5-4B-NVFP4"
+# MODEL_DIR = "Qwen3.5-0.8B-fp8"
+# MODEL_DIR = "Qwen3.5-4B-fp8"
+MODEL_DIR = "Qwen3.5-4B-nvfp4"
 
 # Plain text / coding prompts.
 PROMPTS = [

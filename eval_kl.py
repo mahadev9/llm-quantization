@@ -7,7 +7,8 @@ from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 BASELINE = "Qwen/Qwen3.5-4B"
-QUANT = "Qwen3.5-4B-fp8"
+# QUANT = "Qwen3.5-4B-fp8"
+QUANT = "Qwen3.5-4B-nvfp4"
 
 # BASELINE = "Qwen/Qwen3.5-0.8B"
 # QUANT = "Qwen3.5-0.8B-fp8"

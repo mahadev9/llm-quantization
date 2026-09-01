@@ -20,9 +20,14 @@ model = AutoModelForCausalLM.from_pretrained(
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 
 suffix = "fp8"
+scheme = "FP8_DYNAMIC"
+
+# suffix = "nvfp4"
+# scheme = "NVFP4"
+
 recipe = [
     # AWQModifier(),
-    QuantizationModifier(targets="Linear", scheme="FP8_DYNAMIC", ignore=["lm_head"]),
+    QuantizationModifier(targets="Linear", scheme=scheme, ignore=["lm_head"]),
 ]
 
 # Calibration set shaped like agent/coding traffic: long contexts, raw source
