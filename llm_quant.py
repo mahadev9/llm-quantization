@@ -1,33 +1,57 @@
+import argparse
+import glob
 import json
+import os
 
 from datasets import concatenate_datasets, load_dataset
 from llmcompressor import oneshot
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform.awq import AWQModifier
+from safetensors import safe_open
+from safetensors.torch import load_file, save_file
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# MODEL_ID = "Qwen/Qwen3.5-0.8B"
-# MAX_SEQUENCE_LENGTH = 8192
-# NUM_CALIBRATION_SAMPLES = 512
+from models import MODEL_ID
 
-MODEL_ID = "Qwen/Qwen3.5-4B"
+SCHEME_MAP = {"fp8": "FP8_DYNAMIC", "nvfp4": "NVFP4"}
+
+parser = argparse.ArgumentParser()
+parser.add_argument("scheme", choices=SCHEME_MAP, help="quantization scheme to apply")
+args = parser.parse_args()
+
+suffix = args.scheme
+scheme = SCHEME_MAP[suffix]
+
 MAX_SEQUENCE_LENGTH = 8192
 NUM_CALIBRATION_SAMPLES = 512
 
 model = AutoModelForCausalLM.from_pretrained(
-    MODEL_ID, torch_dtype="auto", device_map="cuda:0"
+    MODEL_ID, torch_dtype="auto", device_map="auto"
 )
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 
-suffix = "fp8"
-scheme = "FP8_DYNAMIC"
+# Text-only calibration set never exercises the vision/audio towers, so their
+# Linear layers get no activation statistics - exclude them (matters most for
+# NVFP4, which needs calibrated input_global_scale; harmless for FP8_DYNAMIC).
+MODALITY_IGNORE = [
+    "re:.*vision_tower.*",
+    "re:.*audio_tower.*",
+    "re:.*embed_vision.*",
+    "re:.*embed_audio.*",
+]
 
-# suffix = "nvfp4"
-# scheme = "NVFP4"
+MOE_IGNORE = [
+    "re:.*mlp.gate$",
+    "re:.*mlp.shared_expert_gate$",
+]
 
 recipe = [
     # AWQModifier(),
-    QuantizationModifier(targets="Linear", scheme=scheme, ignore=["lm_head"]),
+    QuantizationModifier(
+        targets="Linear",
+        scheme=scheme,
+        ignore=["lm_head", *MODALITY_IGNORE, *MOE_IGNORE],
+    ),
 ]
 
 # Calibration set shaped like agent/coding traffic: long contexts, raw source
@@ -83,10 +107,11 @@ def render_tools(e):
         {"role": "user", "content": e["query"]},
         {"role": "assistant", "content": e["answers"]},
     ]
+    # xlam stores bare function schemas; the chat template expects each tool
+    # wrapped OpenAI-style as {"type": "function", "function": {...}}.
+    tools = [{"type": "function", "function": t} for t in json.loads(e["tools"])]
     return {
-        "text": tokenizer.apply_chat_template(
-            messages, tools=json.loads(e["tools"]), tokenize=False
-        )
+        "text": tokenizer.apply_chat_template(messages, tools=tools, tokenize=False)
     }
 
 
@@ -111,22 +136,60 @@ model.save_pretrained(SAVE_DIR, save_compressed=True)
 tokenizer.save_pretrained(SAVE_DIR)
 
 
-def restripe_prefix(save_dir, old="model.language_model.", new="model."):
-    """llmcompressor + transformers 5.14 save decoder weights under
-    `model.language_model.*`, but Qwen3_5ForCausalLM reloads them as `model.*`.
-    Rewrite the checkpoint keys in place so it loads cleanly (transformers + vLLM).
+def fix_saved_key_prefixes(model, save_dir):
     """
-    import glob
-    import os
+    Some ForConditionalGeneration-style wrapper architectures don't
+    round-trip save/load consistently across transformers versions (seen with
+    both Qwen3.5's and Gemma4's text-decoder nesting - in opposite directions).
+    The saved keys can disagree with this model's own module names by a
+    missing or extra "language_model." segment after "model.". Detect that
+    against ground truth (this model's real module names, not a hardcoded
+    architecture list) and repair it in place; a correctly-saved checkpoint
+    is left untouched.
+    """
+    module_names = {n for n, _ in model.named_modules() if n}
 
-    from safetensors.torch import load_file, save_file
+    def resolves(key):
+        # a leaf tensor's owning module is everything but the last segment
+        # (weight / weight_scale / weight_packed / bias / ...); checking any
+        # shorter prefix is wrong; nearly every arch has a top-level "model"
+        # submodule, which would make that check pass unconditionally.
+        parent = key.rsplit(".", 1)[0]
+        return parent in module_names
 
-    rename = lambda k: k.replace(old, new, 1)
+    shard_paths = glob.glob(os.path.join(save_dir, "*.safetensors"))
+    keys = []
+    for path in shard_paths:
+        with safe_open(path, framework="pt") as f:
+            keys.extend(f.keys())
 
-    for path in glob.glob(os.path.join(save_dir, "*.safetensors")):
+    if all(resolves(k) for k in keys):
+        return  # already consistent, nothing to fix
+
+    def strip(k):
+        return k.replace("model.language_model.", "model.", 1)
+
+    def add(k):
+        if k.startswith("model.") and not k.startswith("model.language_model."):
+            return "model.language_model." + k[len("model.") :]
+        return k
+
+    rename = None
+    for transform in (strip, add):
+        candidate = lambda k, t=transform: k if resolves(k) else t(k)
+        if all(resolves(candidate(k)) for k in keys):
+            rename = candidate
+            break
+
+    if rename is None:
+        print(
+            f"warning: could not auto-repair key prefixes in {save_dir}; check manually"
+        )
+        return
+
+    n_changed = sum(1 for k in keys if rename(k) != k)
+    for path in shard_paths:
         sd = load_file(path)
-        if not any(k.startswith(old) for k in sd):
-            continue
         save_file(
             {rename(k): v for k, v in sd.items()}, path, metadata={"format": "pt"}
         )
@@ -148,5 +211,7 @@ def restripe_prefix(save_dir, old="model.language_model.", new="model."):
         with open(config_path, "w") as f:
             json.dump(config, f, indent=2)
 
+    print(f"fix_saved_key_prefixes: renamed {n_changed} keys in {save_dir}")
 
-restripe_prefix(SAVE_DIR)
+
+fix_saved_key_prefixes(model, SAVE_DIR)

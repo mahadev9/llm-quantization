@@ -15,7 +15,7 @@ LIMIT=200
 for model in "${MODELS[@]}"; do
   echo "================ $model ================"
   lm_eval --model hf \
-    --model_args "pretrained=$model,dtype=auto,device_map=cuda:0" \
+    --model_args "pretrained=$model,dtype=auto,device_map=auto" \
     --tasks "$TASKS" \
     --apply_chat_template --fewshot_as_multiturn \
     --batch_size 8 \

@@ -66,7 +66,7 @@ def main():
     t0 = time.time()
     tok = AutoTokenizer.from_pretrained(MODEL_DIR)
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_DIR, torch_dtype="auto", device_map="cuda"
+        MODEL_DIR, torch_dtype="auto", device_map="auto"
     )
     model.eval()
     print(f"[load] {time.time() - t0:.1f}s")

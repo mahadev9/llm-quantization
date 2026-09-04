@@ -1,3 +1,4 @@
+import argparse
 import json
 from collections import defaultdict
 
@@ -6,12 +7,13 @@ import torch.nn.functional as F
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-BASELINE = "Qwen/Qwen3.5-4B"
-# QUANT = "Qwen3.5-4B-fp8"
-QUANT = "Qwen3.5-4B-nvfp4"
+from models import MODEL_ID as BASELINE
 
-# BASELINE = "Qwen/Qwen3.5-0.8B"
-# QUANT = "Qwen3.5-0.8B-fp8"
+parser = argparse.ArgumentParser()
+parser.add_argument("scheme", choices=["fp8", "nvfp4"], help="quantization scheme to evaluate")
+args = parser.parse_args()
+
+QUANT = f"{BASELINE.rstrip('/').split('/')[-1]}-{args.scheme}"
 
 N_SAMPLES = 128  # per bucket
 SEQ_LEN = 2048
@@ -19,7 +21,7 @@ SEQ_LEN = 2048
 
 def load(name):
     return AutoModelForCausalLM.from_pretrained(
-        name, torch_dtype="auto", device_map="cuda:0"
+        name, torch_dtype="auto", device_map="auto"
     ).eval()
 
 
@@ -37,12 +39,15 @@ def build_samples(tok):
     tools_ds = load_dataset("Salesforce/xlam-function-calling-60k", split="train")
     tools_ds = tools_ds.shuffle(seed=0).select(range(N_SAMPLES))
     for e in tools_ds:
+        # xlam stores bare function schemas; the chat template expects each
+        # tool wrapped OpenAI-style as {"type": "function", "function": {...}}.
+        tools = [{"type": "function", "function": t} for t in json.loads(e["tools"])]
         text = tok.apply_chat_template(
             [
                 {"role": "user", "content": e["query"]},
                 {"role": "assistant", "content": e["answers"]},
             ],
-            tools=json.loads(e["tools"]),
+            tools=tools,
             tokenize=False,
         )
         samples.append(("agentic", text))
