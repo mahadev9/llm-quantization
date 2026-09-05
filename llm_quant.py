@@ -45,12 +45,22 @@ MOE_IGNORE = [
     "re:.*mlp.shared_expert_gate$",
 ]
 
+# Most quantization-sensitive Linear layers in a transformer block (see
+# GPTQ/AWQ literature): down_proj sits right after the MLP nonlinearity and
+# sees the widest activation outliers; o_proj is the analogous spot in
+# attention. Keeping these full-precision is the cheapest accuracy lever
+# available without touching calibration data or requiring AWQ support.
+SENSITIVE_IGNORE = [
+    "re:.*mlp.down_proj$",
+    "re:.*self_attn.o_proj$",
+]
+
 recipe = [
     # AWQModifier(),
     QuantizationModifier(
         targets="Linear",
         scheme=scheme,
-        ignore=["lm_head", *MODALITY_IGNORE, *MOE_IGNORE],
+        ignore=["lm_head", *MODALITY_IGNORE, *MOE_IGNORE, *SENSITIVE_IGNORE],
     ),
 ]
 
