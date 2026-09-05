@@ -2,6 +2,7 @@ import argparse
 import glob
 import json
 import os
+import re
 
 from datasets import concatenate_datasets, load_dataset
 from llmcompressor import oneshot
@@ -55,12 +56,33 @@ SENSITIVE_IGNORE = [
     "re:.*self_attn.o_proj$",
 ]
 
+# First/last transformer blocks are consistently the most quantization-
+# sensitive in the GPTQ/AWQ/INT8 literature - they handle the rawest token
+# representations and the final representation before lm_head, so errors
+# there don't get absorbed by later layers the way mid-stack errors do.
+# Derived from the actual model's module names rather than a config field,
+# since layer nesting differs across architectures (flat for Qwen3.5,
+# under "language_model." for Gemma4's ForConditionalGeneration wrapper).
+layer_indices = {
+    int(m.group(1)) for n, _ in model.named_modules() if (m := re.search(r"\.layers\.(\d+)\.", n))
+}
+FIRST_LAST_IGNORE = [
+    f"re:.*layers\\.{min(layer_indices)}\\..*",
+    f"re:.*layers\\.{max(layer_indices)}\\..*",
+]
+
 recipe = [
     # AWQModifier(),
     QuantizationModifier(
         targets="Linear",
         scheme=scheme,
-        ignore=["lm_head", *MODALITY_IGNORE, *MOE_IGNORE, *SENSITIVE_IGNORE],
+        ignore=[
+            "lm_head",
+            *MODALITY_IGNORE,
+            *MOE_IGNORE,
+            *SENSITIVE_IGNORE,
+            *FIRST_LAST_IGNORE,
+        ],
     ),
 ]
 
