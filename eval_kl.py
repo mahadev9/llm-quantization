@@ -17,6 +17,13 @@ QUANT = f"{BASELINE.rstrip('/').split('/')[-1]}-{args.scheme}"
 
 N_SAMPLES = 128  # per bucket
 SEQ_LEN = 2048
+# Baseline and quant are loaded one at a time (never both in VRAM together -
+# needed once the model is big enough that two copies don't fit even on an
+# 80GB GPU). KL is truncated to the baseline's top-K tokens per position so
+# the cache between the two passes stays tiny instead of holding a full
+# vocab-sized distribution; for a peaked LM output distribution this is a
+# very close approximation of the exact KL, not the exact value.
+TOP_K = 100
 
 
 def load(name):
@@ -60,26 +67,43 @@ def main():
     tok = AutoTokenizer.from_pretrained(BASELINE)
     samples = build_samples(tok)
 
+    tokenized = [
+        (bucket, tok(text, return_tensors="pt", truncation=True, max_length=SEQ_LEN).input_ids)
+        for bucket, text in samples
+    ]
+
+    # pass 1: baseline only. Cache its top-K logprobs + token indices per
+    # position (topk sorts descending, so index 0 is the argmax / top-1 token).
     ref = load(BASELINE)
+    cached = []
+    for bucket, ids in tokenized:
+        lp = F.log_softmax(ref(ids.cuda()).logits[0, :-1].float(), dim=-1)
+        topk_lp, topk_idx = lp.topk(TOP_K, dim=-1)
+        cached.append((bucket, ids, topk_lp.cpu(), topk_idx.cpu()))
+    del ref
+    torch.cuda.empty_cache()
+
+    # pass 2: quant only. Gather its logprobs at the baseline's top-K indices.
     qmodel = load(QUANT)
 
     stats = defaultdict(lambda: [0.0, 0, 0])  # kl_sum, tokens, top1_agree
 
-    for bucket, text in samples:
-        ids = tok(
-            text, return_tensors="pt", truncation=True, max_length=SEQ_LEN
-        ).input_ids.cuda()
+    for bucket, ids, ref_topk_lp, ref_topk_idx in cached:
+        ref_topk_lp = ref_topk_lp.cuda()
+        ref_topk_idx = ref_topk_idx.cuda()
 
-        ref_lp = F.log_softmax(ref(ids).logits[0, :-1].float(), dim=-1)
-        q_lp = F.log_softmax(qmodel(ids).logits[0, :-1].float(), dim=-1)
+        q_lp = F.log_softmax(qmodel(ids.cuda()).logits[0, :-1].float(), dim=-1)
+        q_topk_lp = q_lp.gather(-1, ref_topk_idx)
 
-        # KL(ref || quant) per position
-        kl = (ref_lp.exp() * (ref_lp - q_lp)).sum(-1)
+        # KL(ref || quant) truncated to ref's top-K mass per position
+        p = ref_topk_lp.exp()
+        kl = (p * (ref_topk_lp - q_topk_lp)).sum(-1)
 
         s = stats[bucket]
         s[0] += kl.sum().item()
         s[1] += kl.numel()
-        s[2] += (ref_lp.argmax(-1) == q_lp.argmax(-1)).sum().item()
+        # top-1 agreement uses quant's true (full-vocab) argmax, not truncated
+        s[2] += (ref_topk_idx[:, 0] == q_lp.argmax(-1)).sum().item()
 
     print(f"baseline : {BASELINE}")
     print(f"quant    : {QUANT}\n")
